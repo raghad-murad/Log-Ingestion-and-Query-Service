@@ -1,11 +1,15 @@
+import { join } from 'node:path';
 import { loadConfig } from './config';
 import { createPool, verifyConnection } from './infra/db';
+import { runMigrations } from './infra/migrator';
+import { ensurePartitions } from './repository/partitionManager';
 import { createReadiness } from './health/readiness';
 import { buildServer } from './server';
 
-async function main(): Promise<void> {
+// migrations/ lives at the project root, next to dist/ and src/
+const MIGRATIONS_DIR = join(__dirname, '..', 'migrations');
 
-    // Load configuration and initialize readiness state
+async function main(): Promise<void> {
     const config = loadConfig();
     const readiness = createReadiness();
 
@@ -14,14 +18,17 @@ async function main(): Promise<void> {
     await app.listen({ port: config.port, host: '0.0.0.0' });
     app.log.info(`listening on :${config.port} (state=starting)`);
 
-    // Startup sequence, where /health stays 503 until this completes
+    // Startup sequenceو, where /health stays 503 until this completes
     const pool = createPool(config);
+
     await verifyConnection(pool);
     app.log.info('database connection verified');
 
-    // Step B will insert here, before markReady():
-    // await runMigrations(pool);
-    // await ensurePartitions(pool, config);
+    const applied = await runMigrations(pool, MIGRATIONS_DIR);
+    app.log.info(`migrations applied: ${applied.length ? applied.join(', ') : 'none (up to date)'}`);
+
+    const partitions = await ensurePartitions(pool, config);
+    app.log.info(`partitions ensured: ${partitions.length} (retention ${config.retentionDays}d + look-ahead)`);
 
     readiness.markReady();
     app.log.info('service ready (/health -> 200)');
@@ -33,10 +40,8 @@ async function main(): Promise<void> {
         await pool.end();
         process.exit(0);
     };
-
     process.on('SIGTERM', () => void shutdown('SIGTERM'));
     process.on('SIGINT', () => void shutdown('SIGINT'));
-
 }
 
 main().catch((err) => {
