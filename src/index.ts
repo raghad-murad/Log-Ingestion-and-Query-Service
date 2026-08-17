@@ -5,10 +5,11 @@ import { runMigrations } from './infra/migrator';
 import { ensurePartitions } from './repository/partitionManager';
 import { createLogRepository } from './repository/logRepository';
 import { createLogService } from './services/logService';
+import { createRetentionService } from './services/retentionService';
+import { createRetentionScheduler } from './scheduler/retentionScheduler';
 import { createReadiness } from './health/readiness';
 import { buildServer } from './server';
 
-// migrations/ lives at the project root, next to dist/ and src/
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations');
 
 async function main(): Promise<void> {
@@ -16,16 +17,16 @@ async function main(): Promise<void> {
     const readiness = createReadiness();
     const pool = createPool(config);
 
-    // Wire the layers: repository -> service -> routes
     const logRepository = createLogRepository(pool);
     const logService = createLogService(logRepository);
 
-    // Start the HTTP server first, so /health can report 503 during startup
+    // Start the HTTP server first, so /health can report 503 during startup.
     const app = buildServer({ readiness, logService });
     await app.listen({ port: config.port, host: '0.0.0.0' });
     app.log.info(`listening on :${config.port} (state=starting)`);
 
-    // Startup sequence: /health stays 503 until this completes
+    // Startup sequence, where /health stays 503 until this completes ---
+    // Startup failures throw -> service never becomes ready (see main().catch).
     await verifyConnection(pool);
     app.log.info('database connection verified');
 
@@ -38,9 +39,20 @@ async function main(): Promise<void> {
     readiness.markReady();
     app.log.info('service ready (/health -> 200)');
 
+    // Background retention maintenance (off the hot path)
+    // First cycle runs immediately; failures are logged, not fatal.
+    const retentionService = createRetentionService(pool, config, app.log);
+    const retentionScheduler = createRetentionScheduler(
+        retentionService,
+        config.maintenanceIntervalMs,
+        app.log,
+    );
+    retentionScheduler.start();
+
     // Graceful shutdown
     const shutdown = async (signal: string): Promise<void> => {
         app.log.info(`received ${signal}, shutting down`);
+        retentionScheduler.stop();
         await app.close();
         await pool.end();
         process.exit(0);

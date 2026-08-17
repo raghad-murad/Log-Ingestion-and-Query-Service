@@ -1,7 +1,5 @@
-/**
-    Application configuration.
-    Values are loaded from environment variables with sensible defaults for optional settings.
-*/
+// Application configuration, read from environment variables with typed defaults.
+// A bare `docker compose up` provides everything the service needs.
 
 export interface Config {
     port: number;
@@ -9,6 +7,7 @@ export interface Config {
     retentionDays: number;
     dbPoolSize: number;
     statementTimeoutMs: number;
+    maintenanceIntervalMs: number;
 }
 
 function requiredEnv(name: string): string {
@@ -32,5 +31,6 @@ export function loadConfig(): Config {
         retentionDays: numberEnv('RETENTION_DAYS', 30),
         dbPoolSize: numberEnv('DB_POOL_SIZE', 8),
         statementTimeoutMs: numberEnv('STATEMENT_TIMEOUT_MS', 2000),
+        maintenanceIntervalMs: numberEnv('MAINTENANCE_INTERVAL_MS', 3_600_000), // 1 hour
     };
 }
