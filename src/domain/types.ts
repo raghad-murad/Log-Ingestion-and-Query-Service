@@ -58,3 +58,30 @@ export interface QueryResult {
     logs: LogView[];
     next_cursor: string | null;
 }
+
+// Aggregation (GET /logs/aggregate)
+export type BucketSize = '1m' | '5m' | '1h' | '1d';
+export type GroupBy = 'service' | 'level';
+
+// A parsed, validated aggregation query. Reuses the same filter fields as
+// QueryFilter (service, level, since, until, attributes, q) plus bucket/groupBy.
+export interface AggregationQuery {
+    service?: string;
+    level?: LogLevel;
+    since: string;   // required, inclusive
+    until: string;   // required, exclusive
+    attributes: Record<string, string>;
+    q?: string;
+    bucket: BucketSize;
+    groupBy?: GroupBy;
+}
+
+export interface BucketRow {
+    start: string;
+    group: string | null;
+    count: number;
+}
+
+export interface AggregationResult {
+     buckets: BucketRow[];
+}

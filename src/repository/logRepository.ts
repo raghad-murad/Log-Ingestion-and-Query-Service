@@ -2,10 +2,10 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import type { Pool } from 'pg';
 import { from as copyFrom } from 'pg-copy-streams';
-import type { LogEntry, QueryFilter } from '../domain/types';
+import type { LogEntry, QueryFilter, AggregationQuery, BucketRow } from '../domain/types';
 import { buildLogQuery } from './queryBuilder';
+import { buildAggregateQuery } from './aggregateQueryBuilder';
 
-// A row as returned by GET /logs (id serialized as string; see DESIGN.md §7).
 export interface LogRow {
     id: string;
     timestamp: string;
@@ -15,7 +15,6 @@ export interface LogRow {
     attributes: Record<string, unknown>;
 }
 
-// COPY helpers (ingestion)
 function copyEscape(value: string): string {
     return value
         .replace(/\\/g, '\\\\')
@@ -37,46 +36,55 @@ function toCopyLine(entry: LogEntry): string {
 
 export interface LogRepository {
     insertBatch(entries: LogEntry[]): Promise<void>;
-    // Returns up to (limit + 1) rows so the caller can detect a next page.
     find(filter: QueryFilter): Promise<LogRow[]>;
+    aggregate(agg: AggregationQuery): Promise<BucketRow[]>;
 }
 
 export function createLogRepository(pool: Pool): LogRepository {
     return {
         async insertBatch(entries: LogEntry[]): Promise<void> {
-            if (entries.length === 0) return;
-            const client = await pool.connect();
-            try {
-                await client.query('BEGIN');
-                const stream = client.query(
-                copyFrom(
-                    `COPY logs (timestamp, level, service, message, attributes)
-                    FROM STDIN WITH (FORMAT text)`,
-                ),
-                );
-                const source = Readable.from(entries.map(toCopyLine));
-                await pipeline(source, stream);
-                await client.query('COMMIT');
-            } catch (err) {
-                await client.query('ROLLBACK');
-                throw err;
-            } finally {
-                client.release();
-            }
+        if (entries.length === 0) return;
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+            const stream = client.query(
+            copyFrom(
+                `COPY logs (timestamp, level, service, message, attributes)
+                FROM STDIN WITH (FORMAT text)`,
+            ),
+            );
+            const source = Readable.from(entries.map(toCopyLine));
+            await pipeline(source, stream);
+            await client.query('COMMIT');
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        } finally {
+            client.release();
+        }
         },
 
         async find(filter: QueryFilter): Promise<LogRow[]> {
-            const { sql, params } = buildLogQuery(filter);
-            // id is bigint; return it as text to preserve precision at the JS/API boundary.
-            const { rows } = await pool.query(sql, params);
-            return rows.map((r) => ({
-                id: String(r.id),
-                timestamp: new Date(r.timestamp).toISOString(),
-                level: r.level,
-                service: r.service,
-                message: r.message,
-                attributes: r.attributes,
-            }));
+        const { sql, params } = buildLogQuery(filter);
+        const { rows } = await pool.query(sql, params);
+        return rows.map((r) => ({
+            id: String(r.id),
+            timestamp: new Date(r.timestamp).toISOString(),
+            level: r.level,
+            service: r.service,
+            message: r.message,
+            attributes: r.attributes,
+        }));
+        },
+
+        async aggregate(agg: AggregationQuery): Promise<BucketRow[]> {
+        const { sql, params } = buildAggregateQuery(agg);
+        const { rows } = await pool.query(sql, params);
+        return rows.map((r) => ({
+            start: new Date(r.bucket_start).toISOString(),
+            group: r.grp === null ? null : String(r.grp),
+            count: Number(r.cnt),
+        }));
         },
     };
 }
