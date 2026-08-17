@@ -9,7 +9,7 @@ within tight container limits (app: 0.5 CPU / 256 MB, Postgres: 1 CPU / 1 GB).
 > [`docs/design.md`](docs/design.md). Full requirements in [`docs/requirements.md`](docs/requirements.md).
 
 <!-- CI badge placeholder: add once the pipeline is live -->
-<!-- ![CI](https://github.com/raghad-murad/Log-Ingestion-and-Query-Service.git/actions/workflows/ci.yml/badge.svg) -->
+<!-- ![CI](https://github.com/raghad-murad/<repo>/actions/workflows/ci.yml/badge.svg) -->
 
 ## Table of contents
 
@@ -188,10 +188,13 @@ Configurable via `RETENTION_DAYS` (default 30). Retention is enforced by **dropp
 partitions** past the window — an O(1) metadata operation with **no row-by-row `DELETE`, no long
 locks, no table bloat, and no contention with ingestion**.
 
-A partition manager runs two responsibilities at startup and on a timer: (1) ensure in-window and
-near-future partitions exist (missing entries are created lazily at ingest so a valid old-timestamp
-entry never fails), and (2) drop expired partitions. Retention is enforced at **daily granularity**
-— up to ~1 day beyond `RETENTION_DAYS` may persist until the next drop.
+A `RetentionScheduler` (when) runs one maintenance cycle immediately after startup and then hourly,
+driving a `RetentionService` (what) that calls the `PartitionManager` (how) to (1) ensure the
+retention window + look-ahead partitions exist and (2) drop expired partitions. Partition creation
+is kept **off the ingestion hot path** (startup + periodic maintenance only). A failed maintenance
+cycle is logged and retried next interval — it never takes the service down; a startup failure, by
+contrast, keeps the service not-ready. Retention is enforced at **daily granularity** — up to ~1 day
+beyond `RETENTION_DAYS` may persist until the next drop.
 
 ## Performance
 
@@ -205,21 +208,66 @@ entry never fails), and (2) drop expired partitions. Retention is enforced at **
 | Ingest → queryable | ≤ 20 s |
 | Concurrent read | ≥ 1 aggregation/sec during ingest |
 
-**Measured results** — _to be filled after load testing (`scripts/loadgen/`)._
+**Methodology.** A custom TypeScript load generator (`scripts/loadgen/`, separate from the service)
+runs staged workloads against the containerized service under its real resource limits. Ingestion is
+closed-loop: a fixed pool of workers each POST a batch, await the response, and send the next;
+throughput = accepted logs ÷ elapsed. Aggregation latency is probed concurrently. Run with
+`npx tsx scripts/loadgen/run.ts <smoke|ingest|concurrent|seed>`.
 
-| Dimension | Value |
-|-----------|-------|
-| Test environment | _TBD_ |
-| Dataset size | _TBD_ |
-| Batch size | _TBD_ |
-| Ingestion rate (logs/sec) | _TBD_ |
-| Query rate | _TBD_ |
-| Query latency p50 / p95 / p99 | _TBD_ |
-| Resource usage (CPU / RAM) | _TBD_ |
-| Bottlenecks discovered | _TBD_ |
-| Optimizations applied | _TBD_ |
+**Result summary — all targets met with no added indexes or rollups.**
 
-Methodology and the load-generation approach will be documented here once measured.
+| Dimension | Result |
+|-----------|--------|
+| Test environment | Docker Compose on WSL2; app 0.5 CPU / 256 MB, Postgres 16 / 1 CPU / 1 GB |
+| Dataset size | 1,016,000 rows (~1 month, spread across 30 daily partitions) |
+| Best batch config | 8 workers × 1,000 (best throughput/latency balance) |
+| Sustained ingestion | **19,000–25,000 logs/sec**, 0 errors (target ≥ 15,000) |
+| Ingest during seed | ~23,000 logs/sec (1.01M rows in 44 s) |
+| Aggregation p95 (under concurrent ingest) | **~620–800 ms** (target < 1,000 ms) |
+| Query latency, 1M rows — `/logs` time-bounded | ~1 ms execution (see EXPLAIN below) |
+| Query latency, 1M rows — `/logs/aggregate` 7-day window, grouped | ~0.5 s wall |
+| Query latency, 1M rows — `attr.<key>` filter (`->>`, no GIN) | ~40 ms wall |
+| Resource usage under load | app ~50% of 0.5 CPU, 37 MB / 256 MB; Postgres ~61% of 1 CPU, 363 MB / 1 GB |
+
+**Ingestion ramp** (8 s per config):
+
+| workers | batch | throughput/s | p95 (ms) | errors |
+|--------:|------:|-------------:|---------:|-------:|
+| 2 | 100 | 9,822 | 66 | 0 |
+| 4 | 250 | 16,896 | 102 | 0 |
+| 4 | 500 | 17,308 | 194 | 0 |
+| 8 | 500 | 17,839 | 362 | 0 |
+| 8 | 1000 | 19,178 | 610 | 0 |
+| 16 | 1000 | 19,815 | 995 | 0 |
+| 16 | 2000 | 21,220 | 1,977 | 0 |
+
+The trade-off is visible: throughput keeps rising with load, but p95 rises with it. `8×1000` is the
+chosen operating point — it clears 15k/s comfortably while keeping p95 well under a second.
+
+**Bottleneck.** The app container runs at ~50% of its 0.5 CPU while ingesting ~19k/s — matching the
+budget math (§1a: 15k/s leaves almost no CPU headroom). Postgres CPU (not memory) is the shared
+constraint, which is why aggregation p95 rises as ingestion workers increase (§1e). Memory was never
+close to its limit on either container.
+
+**`EXPLAIN ANALYZE` — the key architectural decisions, proven.** For a time-bounded `/logs` query
+over the 1M-row table:
+
+```
+Limit  (actual time=0.053..0.845 rows=100)
+  ->  Append
+        Subplans Removed: 29                          <- partition pruning: 29 of 33 partitions skipped
+        ->  Index Scan Backward using logs_2026_08_17_pkey ...   <- PK (timestamp,id) serves DESC order
+        ->  Index Scan Backward using logs_2026_08_16_pkey ... (never executed)  <- LIMIT stopped early
+Execution Time: 1.007 ms
+```
+
+This confirms, on real data: **partition pruning** removes irrelevant partitions, the **composite PK
+`(timestamp, id)` is scanned backward** to satisfy `ORDER BY timestamp DESC, id DESC` with no extra
+index, and the **`LIMIT` bounds the work** regardless of table size.
+
+**Deferred decisions — measured, not needed.** The design deferred a `service` composite index, an
+attribute index, and rollup tables pending measurement. Benchmarks show the baseline meets every
+target, so **none were added**. The simplest design that satisfies the requirements is the one shipped.
 
 ## Configuration
 
@@ -231,8 +279,9 @@ All configuration is via environment variables with sensible defaults; a bare
 | `PORT` | `8080` | HTTP port inside the container |
 | `DATABASE_URL` | (set by compose) | PostgreSQL connection string |
 | `RETENTION_DAYS` | `30` | Age past which daily partitions are dropped |
-| `DB_POOL_SIZE` | _TBD_ | Connection pool size (tuned by benchmark) |
-| `STATEMENT_TIMEOUT_MS` | _TBD_ | Per-query timeout (tuned by benchmark) |
+| `DB_POOL_SIZE` | `8` | Connection pool size (kept small for the 1-CPU Postgres) |
+| `STATEMENT_TIMEOUT_MS` | `2000` | Per-query timeout |
+| `MAINTENANCE_INTERVAL_MS` | `3600000` | Retention maintenance interval (1 hour) |
 
 ## Optional features
 
