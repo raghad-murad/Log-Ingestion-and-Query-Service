@@ -24,3 +24,37 @@ export interface IngestResult {
     accepted: number;
     rejected: RejectedEntry[];
 }
+
+// Keyset pagination cursor payload: the (timestamp, id) of the last row seen.
+export interface Cursor {
+    timestamp: string;
+    id: string;
+}
+
+// A parsed, validated query for GET /logs.
+export interface QueryFilter {
+    service?: string;
+    level?: LogLevel;
+    since?: string;   // ISO 8601, inclusive
+    until?: string;   // ISO 8601, exclusive
+    attributes: Record<string, string>; // attr.<key> = value (compared as string)
+    q?: string;
+    limit: number;    // 1..1000
+    cursor?: Cursor;
+}
+
+// A log as returned by the API (id serialized as string).
+export interface LogView {
+    id: string;
+    timestamp: string;
+    level: string;
+    service: string;
+    message: string;
+    attributes: Record<string, unknown>;
+}
+
+// GET /logs response.
+export interface QueryResult {
+    logs: LogView[];
+    next_cursor: string | null;
+}
