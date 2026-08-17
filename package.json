@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "High-performance log ingestion and query service",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
@@ -13,11 +15,13 @@
   },
   "dependencies": {
     "fastify": "^5.2.0",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "pg-copy-streams": "^7.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.10",
+    "@types/pg-copy-streams": "^1.2.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
