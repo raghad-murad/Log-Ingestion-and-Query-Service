@@ -3,6 +3,8 @@ import { loadConfig } from './config';
 import { createPool, verifyConnection } from './infra/db';
 import { runMigrations } from './infra/migrator';
 import { ensurePartitions } from './repository/partitionManager';
+import { createLogRepository } from './repository/logRepository';
+import { createLogService } from './services/logService';
 import { createReadiness } from './health/readiness';
 import { buildServer } from './server';
 
@@ -12,15 +14,18 @@ const MIGRATIONS_DIR = join(__dirname, '..', 'migrations');
 async function main(): Promise<void> {
     const config = loadConfig();
     const readiness = createReadiness();
+    const pool = createPool(config);
+
+    // Wire the layers: repository -> service -> routes
+    const logRepository = createLogRepository(pool);
+    const logService = createLogService(logRepository);
 
     // Start the HTTP server first, so /health can report 503 during startup
-    const app = buildServer({ readiness });
+    const app = buildServer({ readiness, logService });
     await app.listen({ port: config.port, host: '0.0.0.0' });
     app.log.info(`listening on :${config.port} (state=starting)`);
 
-    // Startup sequenceو, where /health stays 503 until this completes
-    const pool = createPool(config);
-
+    // Startup sequence: /health stays 503 until this completes
     await verifyConnection(pool);
     app.log.info('database connection verified');
 
