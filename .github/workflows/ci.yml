@@ -1,0 +1,76 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+       branches: [main]
+
+jobs:
+    build-and-test:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '22'
+                  cache: 'npm'
+
+            - name: Install dependencies
+                run: npm ci
+
+            - name: Typecheck
+                run: npm run typecheck
+
+            - name: Lint
+                run: npm run lint
+
+            - name: Unit tests
+                run: npm test
+
+            - name: Build
+                run: npm run build
+
+    smoke-test:
+        runs-on: ubuntu-latest
+        needs: build-and-test
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Build and start the stack
+              run: docker compose up --build -d
+
+            - name: Wait for /health and run a contract smoke test
+              run: |
+                  echo "waiting for service to become ready..."
+                  for i in $(seq 1 60); do
+                    if curl -sf http://localhost:8080/health > /dev/null; then
+                      echo "service is ready"
+                      break
+                    fi
+                    sleep 2
+                  done
+
+                  # ingest a batch
+                  TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                  RESP=$(curl -s -X POST http://localhost:8080/logs \
+                    -H "Content-Type: application/json" \
+                    -d "{\"logs\":[{\"timestamp\":\"$TS\",\"level\":\"error\",\"service\":\"checkout\",\"message\":\"payment declined\",\"attributes\":{\"user_id\":\"42\"}}]}")
+                  echo "ingest response: $RESP"
+                  echo "$RESP" | grep -q '"accepted":1' || { echo "ingest failed"; exit 1; }
+
+                  # query it back
+                  curl -sf "http://localhost:8080/logs?service=checkout&limit=10" | grep -q '"logs"' || { echo "query failed"; exit 1; }
+
+                  # aggregate
+                  SINCE=$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+                  UNTIL=$(date -u -d '10 minutes' +%Y-%m-%dT%H:%M:%SZ)
+                  curl -sf "http://localhost:8080/logs/aggregate?since=$SINCE&until=$UNTIL&bucket=1m&group_by=service" | grep -q '"buckets"' || { echo "aggregate failed"; exit 1; }
+
+                  echo "contract smoke test passed"
+
+            - name: Tear down
+              if: always()
+              run: docker compose down -v
